@@ -13,7 +13,14 @@ function Get-PinnedPackage([string]$Name, [string]$Url, [string]$Sha256) {
     if (-not (Test-Path $archive)) {
         Invoke-WebRequest -Uri $Url -OutFile $archive
     }
-    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    # .NET hashing avoids a dependency on the Microsoft.PowerShell.Utility module path.
+    $stream = [System.IO.File]::OpenRead($archive)
+    try {
+        $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
+    } finally {
+        $stream.Dispose()
+    }
+    $actual = ([System.BitConverter]::ToString($digest) -replace "-", "").ToLowerInvariant()
     if ($actual -ne $Sha256) {
         throw "Checksum mismatch for $archive. Remove this archive before a retry."
     }

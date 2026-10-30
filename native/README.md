@@ -7,8 +7,8 @@ The bridge compiles against the actual Agility SDK 1.722.0-preview headers.
 The Windows x64 DLL and smoke executable also passed a link check with Zig's C++ compiler.
 The LinAlg shader compiles with preview DXC v1.10.2605.37.
 The scalar Gyro decoder compiles with the same compiler under `cs_6_0`.
-No Windows GPU execution test ran in the Linux development environment.
-This backend does not perform Qwen inference.
+The transfer, LinAlg, and Gyro validation commands pass on an RTX 5090 Laptop GPU with driver 32.0.16.2101.
+The bindless compute API below runs the Qwen4Exp inference kernels.
 
 ## Dependencies
 
@@ -133,7 +133,26 @@ Maximum absolute error remains available as a diagnostic.
 The decoder produces values in the stored basis.
 It does not apply the Hadamard transform.
 The conformance path requires SM 6.0 and does not require LinAlg support.
-This path does not claim GPU parity until the hardware test passes.
+The hardware test passed for all eight types on the validation machine.
+
+## Bindless compute contract
+
+`gd_create` builds the bindless state when the adapter reports Shader Model 6.6 or later.
+That state consists of one shader-visible descriptor heap with 65,536 entries and one root signature holding 60 root constants.
+The root signature sets `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`.
+
+- `gd_create_resource` allocates a buffer with a raw SRV and a raw UAV.
+  `GD_RESOURCE_HOST` buffers are persistently mapped write-back memory that shaders can also access.
+- `gd_create_pipeline` builds a compute pipeline from DXIL compiled for `cs_6_6` against that root signature.
+- `gd_begin`, `gd_dispatch`, `gd_barrier`, `gd_timestamp`, and `gd_submit` record work on a ring of three command lists.
+  `gd_barrier` inserts a global UAV barrier.
+- `gd_read_ranges_after` writes file ranges into any buffer after a named compute ticket.
+  The expert scheduler uses it for slot arenas.
+- `gd_wait_storage` verifies the status of every batch up to a ticket.
+
+Within one submission, a shader reads a buffer either through its SRV or through its UAV, never both.
+Bindless dispatches do not record which buffers they touch.
+`gd_release_buffer` therefore waits for the last bindless submission.
 
 ## Sources
 

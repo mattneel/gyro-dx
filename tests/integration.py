@@ -187,7 +187,6 @@ def exercise(executable, directory):
     assert report["summary"] == expected_summary, report["summary"]
     assert report["architecture"] == "qwen4exp"
     assert report["header_only"] is False
-    assert report["inference_available"] is False
     assert report["tensor_count"] == 8
     assert report["metadata_count"] == metadata_count
     assert report["file_bytes"] == len(raw)
@@ -314,6 +313,15 @@ def exercise(executable, directory):
         malformed.write_bytes(payload)
         runner.error(error, "inspect", malformed)
     print("PASS malformed files fail with specific errors")
+
+    # Inference commands validate arguments before loading weights, and the synthetic fixture
+    # lacks the Qwen4Exp graph metadata, so binding fails with a metadata error.
+    runner.error("MissingPrompt", "generate", model)
+    runner.error("UnknownBackend", "generate", model, "--prompt", "hi", "--backend", "tpu")
+    runner.error("InvalidArguments", "generate", "--prompt", "hi")
+    runner.error("InvalidMetadata", "generate", model, "--prompt", "hi")
+    runner.error("InvalidArguments", "serve")
+    print("PASS inference commands reject invalid requests")
     print(f"PASS {runner.calls} CLI invocations, including {runner.failures} expected failures")
 
 

@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.bin binary
+*.f16 binary
+tests/gyro_vectors.bin binary
+src/gyro_codebook.f16 binary

@@ -9,7 +9,7 @@ pub export const D3D12SDKVersion: u32 = 722;
 pub export const D3D12SDKPath: [*:0]const u8 = ".\\D3D12\\";
 
 const usage =
-    \\gyro-dx: Qwen Gyro engine foundation
+    \\gyro-dx: Qwen4Exp Gyro inference engine
     \\Pinned compiler: Zig 0.18.0-dev.738+ae9a8acc7
     \\
     \\Commands:
@@ -24,12 +24,23 @@ const usage =
     \\  stream MODEL.gguf LAYER EXPERT [ADAPTER_INDEX]
     \\  linalg SHADER.dxil [ADAPTER_INDEX]
     \\  gyro SHADER.dxil [ADAPTER_INDEX]
+    \\  generate MODEL.gguf --prompt TEXT [--raw] [--max-tokens N] [--no-think] [--stats]
+    \\  chat MODEL.gguf [--system TEXT] [--no-think] [--stats]
+    \\  serve MODEL.gguf [--host 127.0.0.1] [--port 8080] [--max-tokens N]
+    \\      OpenAI-compatible /v1/chat/completions, /v1/completions, /v1/models, /health
+    \\  bench MODEL.gguf [--prompt-tokens N] [--gen N] [--profile]
+    \\  tokenize MODEL.gguf --prompt TEXT [--raw] [--no-think]
+    \\  dump MODEL.gguf OUT_DIR (--tokens IDS | --prompt TEXT) [--step] [--filter NAMES] [--gen N]
+    \\
+    \\Backend flags: --backend cpu|gpu --adapter N --experts auto|resident|cache --cache-gib G
+    \\  --reserve-gib G --kernels DIR --debug-layer
+    \\Inference flags: --threads N --ctx N --batch N --temp T --top-k K --top-p P --min-p P
+    \\  --repeat-penalty R --seed S
     \\
     \\inspect-prefix validates a header against a supplied size. It does not inspect payload bytes.
     \\plan uses a usable GPU budget, with an explicit reserve for state and scratch allocations.
     \\replay simulates completed demand reads from a routing trace. It does not measure speed.
     \\probe, stream, linalg, and gyro require the optional Windows native backend.
-    \\This package does not yet generate text.
     \\
 ;
 
@@ -82,7 +93,6 @@ fn inspect(writer: *Io.Writer, item: Loaded, prefix_only: bool) !void {
         .summary = summary,
         .ple = .{ .layer = ple.layer, .heads = core.ple.head_count, .row_bytes = ple.row_bytes,
             .eos_token = ple.eos_token, .vocabulary_size = ple.vocab_size },
-        .inference_available = false,
     });
 }
 
@@ -110,6 +120,13 @@ fn run(io: Io, allocator: Allocator, args: []const []const u8, writer: *Io.Write
         try writer.writeAll(usage); return;
     }
     const command = args[1];
+    const cli = @import("cli.zig");
+    if (std.mem.eql(u8, command, "generate")) return cli.generate(io, allocator, args[2..], writer);
+    if (std.mem.eql(u8, command, "chat")) return cli.interactive(io, allocator, args[2..], writer);
+    if (std.mem.eql(u8, command, "dump")) return cli.dump(io, allocator, args[2..], writer);
+    if (std.mem.eql(u8, command, "tokenize")) return cli.tokenize(io, allocator, args[2..], writer);
+    if (std.mem.eql(u8, command, "bench")) return cli.bench(io, allocator, args[2..], writer);
+    if (std.mem.eql(u8, command, "serve")) return @import("server.zig").serve(io, allocator, args[2..], writer);
     if (std.mem.eql(u8, command, "probe") or std.mem.eql(u8, command, "linalg") or std.mem.eql(u8, command, "gyro")) {
         if (comptime options.native) return @import("native.zig").runStandalone(io, allocator, args, writer);
         return error.NativeBackendNotBuilt;

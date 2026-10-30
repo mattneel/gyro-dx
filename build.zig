@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
     if (native_dir) |dir| {
+        // The Agility SDK finds D3D12SDKVersion and D3D12SDKPath in the executable's export table.
+        exe.rdynamic = true;
         exe.root_module.addLibraryPath(.{ .cwd_relative = dir });
         exe.root_module.linkSystemLibrary("gyro_native", .{});
     }

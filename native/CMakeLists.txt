@@ -72,3 +72,32 @@ if(GYRO_DXC_DIR)
         VERBATIM)
     add_custom_target(gyro-decode-shader ALL DEPENDS "${GYRO_DECODE_OUT}")
 endif()
+
+# Inference kernels: one DXIL file per entry point, Shader Model 6.6 for bindless resources.
+if(GYRO_DXC_DIR)
+    set(GYRO_KERNELS
+        mv:mv_q8 mv:q8_repack mv:mv_bf16 mv:mv_f32
+        moe:moe_route moe:moe_resolve moe:moe_gyro moe:moe_act moe:rotate128 moe:moe_combine
+        ops:norm_rows ops:hc_mix ops:hc_combine ops:hc_init ops:ew
+        gdn:conv_causal gdn:gdn_gates gdn:gdn_step
+        attn:rope_neox attn:store_f16 attn:attn_chunk attn:attn_merge attn:qsa_pool attn:qsa_score attn:qsa_select
+        ple:ple_mix hc:hc_pre hc:hc_post)
+    set(GYRO_KERNEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/kernels")
+    file(GLOB GYRO_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/*.hlsl"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/*.hlsli")
+    set(GYRO_KERNEL_OUTPUTS)
+    foreach(spec IN LISTS GYRO_KERNELS)
+        string(REPLACE ":" ";" parts "${spec}")
+        list(GET parts 0 file)
+        list(GET parts 1 entry)
+        set(out "${GYRO_KERNEL_DIR}/${entry}.dxil")
+        add_custom_command(OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GYRO_KERNEL_DIR}"
+            COMMAND "${GYRO_DXC_DIR}/bin/x64/dxc.exe" -T cs_6_6 -E ${entry} -HV 2021 -O3
+                "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/${file}.hlsl" -Fo "${out}"
+            DEPENDS ${GYRO_KERNEL_SOURCES}
+            VERBATIM)
+        list(APPEND GYRO_KERNEL_OUTPUTS "${out}")
+    endforeach()
+    add_custom_target(gyro-kernels ALL DEPENDS ${GYRO_KERNEL_OUTPUTS})
+endif()

@@ -27,6 +27,5 @@
     "row_bytes": 170,
     "eos_token": 248044,
     "vocabulary_size": 248320
-  },
-  "inference_available": false
+  }
 }

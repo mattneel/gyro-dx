@@ -3,7 +3,19 @@
 pub const gd_context = opaque {};
 pub const gd_file = opaque {};
 pub const gd_buffer = opaque {};
+pub const gd_pipeline = opaque {};
 pub const gd_result = i32;
+
+pub const resource_device: u32 = 0;
+pub const resource_host: u32 = 1;
+
+pub const gd_buffer_info = extern struct {
+    srv_index: u32,
+    uav_index: u32,
+    mapped: ?*anyopaque,
+    gpu_address: u64,
+    allocated_bytes: u64,
+};
 
 pub const gd_options = extern struct {
     adapter_index: u32,
@@ -52,6 +64,22 @@ pub extern fn gd_validate_gyro(context: *gd_context, dxil: [*]const u8, dxil_byt
     codebook: [*]const u8, codebook_bytes: usize, encoded: [*]const u8, packed_bytes: usize,
     type_id: u32, expected: [*]const f32, value_count: u32,
     max_abs_error: *f32, timeout_ms: u32) gd_result;
+pub extern fn gd_create_resource(context: *gd_context, bytes: u64, kind: u32,
+    buffer: *?*gd_buffer, info: *gd_buffer_info) gd_result;
+pub extern fn gd_create_pipeline(context: *gd_context, dxil: [*]const u8, bytes: usize,
+    pipeline: *?*gd_pipeline) gd_result;
+pub extern fn gd_release_pipeline(context: *gd_context, pipeline: *gd_pipeline, timeout_ms: u32) gd_result;
+pub extern fn gd_begin(context: *gd_context, timeout_ms: u32) gd_result;
+pub extern fn gd_dispatch(context: *gd_context, pipeline: *gd_pipeline, constants: ?[*]const u32,
+    constant_count: u32, x: u32, y: u32, z: u32) gd_result;
+pub extern fn gd_barrier(context: *gd_context) gd_result;
+pub extern fn gd_timestamp(context: *gd_context, index: *u32) gd_result;
+pub extern fn gd_submit(context: *gd_context, ticket: *u64) gd_result;
+pub extern fn gd_wait_compute(context: *gd_context, ticket: u64, timeout_ms: u32) gd_result;
+pub extern fn gd_read_timestamps(context: *gd_context, count: u32, ticks: [*]u64, frequency: *u64) gd_result;
+pub extern fn gd_queue_wait_storage(context: *gd_context, storage_ticket: u64) gd_result;
+pub extern fn gd_read_ranges_after(context: *gd_context, file: *gd_file, buffer: *gd_buffer,
+    ranges: [*]const gd_range, count: u32, compute_ticket: u64, storage_ticket: *u64) gd_result;
 pub extern fn gd_release_buffer(context: *gd_context, buffer: *gd_buffer, timeout_ms: u32) gd_result;
 pub extern fn gd_release_file(context: *gd_context, file: *gd_file, timeout_ms: u32) gd_result;
 pub extern fn gd_destroy(context: *gd_context, timeout_ms: u32) gd_result;
@@ -62,4 +90,6 @@ comptime {
     assert(@sizeOf(gd_caps) == 184);
     assert(@sizeOf(gd_range) == 24);
     assert(@offsetOf(gd_caps, "adapter_name") == 56);
+    assert(@sizeOf(gd_buffer_info) == 32);
+    assert(@offsetOf(gd_buffer_info, "mapped") == 8);
 }

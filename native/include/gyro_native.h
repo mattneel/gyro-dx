@@ -19,6 +19,7 @@ extern "C" {
 typedef struct gd_context gd_context;
 typedef struct gd_file gd_file;
 typedef struct gd_buffer gd_buffer;
+typedef struct gd_pipeline gd_pipeline;
 typedef int32_t gd_result;
 
 typedef struct gd_options {
@@ -50,6 +51,16 @@ typedef struct gd_range {
     uint32_t bytes;
     uint32_t reserved;
 } gd_range;
+
+enum { GD_RESOURCE_DEVICE = 0, GD_RESOURCE_HOST = 1 };
+
+typedef struct gd_buffer_info {
+    uint32_t srv_index;
+    uint32_t uav_index;
+    void *mapped;
+    uint64_t gpu_address;
+    uint64_t allocated_bytes;
+} gd_buffer_info;
 
 /* All methods require serialized access to each context.
  * Results use HRESULT semantics. Negative values indicate failure.
@@ -92,6 +103,35 @@ GD_API gd_result gd_validate_gyro(gd_context *context, const void *dxil, size_t 
     const void *codebook, size_t codebook_bytes, const void *packed, size_t packed_bytes,
     uint32_t type_id, const float *expected, uint32_t value_count,
     float *out_max_abs_error, uint32_t timeout_ms);
+/* Bindless compute API (requires Shader Model 6.6).
+ * Every resource receives a raw SRV and a raw UAV in one shader-visible heap; shaders index
+ * ResourceDescriptorHeap with the returned indices. Pipelines share one root signature of
+ * 60 root constants at b0. GD_RESOURCE_DEVICE allocates local video memory. GD_RESOURCE_HOST
+ * allocates persistently mapped write-back system memory that shaders can read and write.
+ * Buffers rely on implicit state promotion: within one submission, read a buffer only through
+ * its SRV or only through its UAV. gd_barrier inserts a global UAV barrier.
+ * A buffer may receive DirectStorage writes into ranges that no in-flight compute reads.
+ */
+GD_API gd_result gd_create_resource(gd_context *context, uint64_t bytes, uint32_t kind,
+    gd_buffer **out_buffer, gd_buffer_info *out_info);
+GD_API gd_result gd_create_pipeline(gd_context *context, const void *dxil, size_t dxil_bytes,
+    gd_pipeline **out_pipeline);
+GD_API gd_result gd_release_pipeline(gd_context *context, gd_pipeline *pipeline, uint32_t timeout_ms);
+GD_API gd_result gd_begin(gd_context *context, uint32_t timeout_ms);
+GD_API gd_result gd_dispatch(gd_context *context, gd_pipeline *pipeline, const uint32_t *constants,
+    uint32_t constant_count, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+GD_API gd_result gd_barrier(gd_context *context);
+GD_API gd_result gd_timestamp(gd_context *context, uint32_t *out_index);
+GD_API gd_result gd_submit(gd_context *context, uint64_t *out_compute_ticket);
+GD_API gd_result gd_wait_compute(gd_context *context, uint64_t ticket, uint32_t timeout_ms);
+GD_API gd_result gd_read_timestamps(gd_context *context, uint32_t count, uint64_t *out_ticks,
+    uint64_t *out_frequency);
+/* Makes later compute submissions wait on the GPU for a storage ticket. */
+GD_API gd_result gd_queue_wait_storage(gd_context *context, uint64_t storage_ticket);
+/* Arena variant of gd_read_ranges: the caller names the compute ticket that must finish before
+ * DirectStorage writes, normally the last use of the evicted slots. No per-buffer busy check. */
+GD_API gd_result gd_read_ranges_after(gd_context *context, gd_file *file, gd_buffer *buffer,
+    const gd_range *ranges, uint32_t count, uint64_t compute_ticket, uint64_t *out_storage_ticket);
 GD_API gd_result gd_release_buffer(gd_context *context, gd_buffer *buffer, uint32_t timeout_ms);
 GD_API gd_result gd_release_file(gd_context *context, gd_file *file, uint32_t timeout_ms);
 GD_API gd_result gd_destroy(gd_context *context, uint32_t timeout_ms);

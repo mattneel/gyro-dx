@@ -12,9 +12,8 @@ A small C++ bridge owns Microsoft COM interfaces and SDK structures.
 HLSL owns GPU kernels.
 The C ABI keeps SDK changes outside the Zig core.
 
-This document describes the intended engine.
-The current package implements the components marked in the README.
-It does not implement the complete schedule below.
+This document describes the engine design and the implemented schedule.
+VALIDATION.md records the evidence for each completion gate.
 
 ## Data paths
 
@@ -145,7 +144,7 @@ A stale lease cannot retire a different expert after slot reuse.
 Batch admission reserves all selected experts or changes nothing.
 This avoids partial eviction when a layer cannot obtain enough slots.
 The production scheduler can also choose explicit expert microbatches when the memory budget cannot hold every selected expert.
-The current planner requires enough capacity for a complete layer route.
+The engine requires enough slots for the routes of one 8-token pass.
 
 ### Demand-read procedure
 
@@ -173,10 +172,10 @@ The DirectStorage documentation describes staging buffers for the raw transfer p
 The API does not establish a universal NVMe-to-VRAM path without host memory.
 The engine measures actual transfer bandwidth and host overhead on the chosen system.
 
-The present bridge uses an independent resource for each slot.
-Each resource returns to `COMMON` between operations.
-That choice avoids simultaneous writes and shader reads in different portions of one resource with incompatible states.
-A later arena design needs an explicit resource and synchronization model.
+The inference engine stores expert slots in arenas of up to 2 GiB each.
+Arena buffers stay in `COMMON` and rely on implicit promotion, so shaders read them only through raw SRVs.
+DirectStorage writes a slot only after the compute fence of the work that last used the evicted slot.
+The cache policy refuses to evict a slot until the observed compute fence covers its last retirement.
 
 ## Bandwidth model
 
@@ -213,10 +212,11 @@ Prefill changes the unique expert set and amortization across token rows.
 | Whole-model correctness | Fixed prompts and token traces agree under controlled sampling |
 | Performance | Warm and cold latency, miss bytes, queue delay, memory peak, and token rate on named hardware |
 
-The first runtime milestone is deterministic full-graph inference with resident packed experts.
-That milestone includes the learned PLE path and all request state.
-The next milestone adds expert eviction with recorded routes and measured miss costs.
-Multi-token prediction and speculative expert prefetch follow those gates.
+Deterministic full-graph inference with resident packed experts is complete on the CPU and the GPU.
+It includes the learned PLE path and all request state.
+Expert eviction with route readback is complete, with measured miss costs.
+The speculative prefetch uses the next layer's router on the current FFN input.
+Multi-token prediction and LinAlg prefill tiles remain open.
 
 The base graph requires gated delta recurrence, sparse attention, and hyper-connections.
 Those operations remain essential even when the matrix and storage paths are complete.

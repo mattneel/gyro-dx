@@ -20,6 +20,8 @@ static_assert(sizeof(gd_options) == 20);
 static_assert(sizeof(gd_caps) == 184);
 static_assert(sizeof(gd_range) == 24);
 static_assert(offsetof(gd_caps, adapter_name) == 56);
+static_assert(sizeof(gd_buffer_info) == 32);
+static_assert(offsetof(gd_buffer_info, mapped) == 8);
 
 template<class T> struct Com {
     T *p = nullptr;
@@ -48,6 +50,19 @@ struct gd_buffer {
     uint64_t bytes = 0;
     uint64_t last_storage = 0;
     uint64_t last_compute = 0;
+    uint32_t srv_index = UINT32_MAX;
+    uint32_t uav_index = UINT32_MAX;
+    void *mapped = nullptr;
+};
+struct gd_pipeline {
+    gd_context *owner;
+    Com<ID3D12PipelineState> pso;
+    uint32_t constant_dwords = 0;
+};
+struct Frame {
+    Com<ID3D12CommandAllocator> allocator;
+    Com<ID3D12GraphicsCommandList> list;
+    uint64_t ticket = 0;
 };
 struct Batch {
     uint64_t ticket;
@@ -75,7 +90,24 @@ struct gd_context {
     std::vector<gd_file*> files;
     std::vector<gd_buffer*> buffers;
     std::vector<Com<IUnknown>> compute_hold;
+    // Bindless compute state: one shader-visible heap, one root signature of root constants.
+    Com<ID3D12DescriptorHeap> heap;
+    Com<ID3D12RootSignature> bindless_root;
+    UINT descriptor_size = 0;
+    uint32_t heap_capacity = 0;
+    uint32_t heap_next = 0;
+    std::vector<uint32_t> heap_free;
+    Frame frames[3];
+    int recording = -1;
+    uint32_t next_frame = 0;
+    uint64_t last_bindless_compute = 0;
+    std::vector<gd_pipeline*> pipelines;
+    Com<ID3D12QueryHeap> timestamps;
+    Com<ID3D12Resource> timestamp_readback;
+    uint32_t timestamp_count = 0;
+    uint64_t timestamp_frequency = 0;
     ~gd_context() {
+        for (auto *p : pipelines) delete p;
         for (auto *b : buffers) delete b;
         for (auto *f : files) delete f;
         if (event) CloseHandle(event);
@@ -192,6 +224,45 @@ static HRESULT submit_compute(gd_context *c, uint64_t *ticket) {
     return c->compute->Signal(c->compute_fence.p, *ticket);
 }
 
+// Bindless compute requires SM 6.6 ResourceDescriptorHeap indexing. Older adapters keep the
+// validation entry points and report DXGI_ERROR_UNSUPPORTED from the compute API.
+static constexpr uint32_t bindless_constant_dwords = 60;
+static HRESULT init_bindless(gd_context *c) {
+    if (c->caps.shader_model < D3D_SHADER_MODEL_6_6) return S_OK;
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = 1u << 16;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    GD_TRY(c->device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(c->heap.put())));
+    c->heap_capacity = heap_desc.NumDescriptors;
+    c->descriptor_size = c->device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    D3D12_ROOT_PARAMETER1 param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    param.Constants = {0, 0, bindless_constant_dwords};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
+    root_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    root_desc.Desc_1_1.NumParameters = 1;
+    root_desc.Desc_1_1.pParameters = &param;
+    root_desc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    Com<ID3DBlob> serialized, errors;
+    GD_TRY(D3D12SerializeVersionedRootSignature(&root_desc, serialized.put(), errors.put()));
+    GD_TRY(c->device->CreateRootSignature(0, serialized->GetBufferPointer(),
+        serialized->GetBufferSize(), IID_PPV_ARGS(c->bindless_root.put())));
+    for (auto &frame : c->frames) {
+        GD_TRY(c->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(frame.allocator.put())));
+        GD_TRY(c->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, frame.allocator.p, nullptr,
+            IID_PPV_ARGS(frame.list.put())));
+        GD_TRY(frame.list->Close());
+    }
+    D3D12_QUERY_HEAP_DESC query{};
+    query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query.Count = 4096;
+    GD_TRY(c->device->CreateQueryHeap(&query, IID_PPV_ARGS(c->timestamps.put())));
+    GD_TRY(make_resource(c, uint64_t(query.Count) * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_FLAG_NONE, c->timestamp_readback));
+    return c->compute->GetTimestampFrequency(&c->timestamp_frequency);
+}
+
 extern "C" gd_result gd_create(const gd_options *options, gd_context **out) {
     if (!out) return E_INVALIDARG;
     *out = nullptr;
@@ -235,9 +306,16 @@ extern "C" gd_result gd_create(const gd_options *options, gd_context **out) {
                 c->caps.local_usage_bytes = memory.CurrentUsage;
             }
         }
-        D3D12_FEATURE_DATA_SHADER_MODEL shader{D3D_SHADER_MODEL_6_10};
-        if (SUCCEEDED(c->device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader, sizeof(shader))))
-            c->caps.shader_model = shader.HighestShaderModel;
+        // The runtime rejects shader models it does not know, so query from the newest downward.
+        const D3D_SHADER_MODEL models[] = {D3D_SHADER_MODEL_6_10, D3D_SHADER_MODEL_6_9, D3D_SHADER_MODEL_6_8,
+            D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_0};
+        for (D3D_SHADER_MODEL model : models) {
+            D3D12_FEATURE_DATA_SHADER_MODEL shader{model};
+            if (SUCCEEDED(c->device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader, sizeof(shader)))) {
+                c->caps.shader_model = shader.HighestShaderModel;
+                break;
+            }
+        }
         D3D12_FEATURE_DATA_LINEAR_ALGEBRA_SUPPORT tier{};
         if (SUCCEEDED(c->device->CheckFeatureSupport(D3D12_FEATURE_LINEAR_ALGEBRA_SUPPORT, &tier, sizeof(tier))))
             c->caps.linalg_tier = tier.LinearAlgebraTier;
@@ -277,6 +355,7 @@ extern "C" gd_result gd_create(const gd_options *options, gd_context **out) {
         storage_desc.Name = "gyro-expert-reads";
         storage_desc.Device = c->device.p;
         GD_TRY(c->storage_factory->CreateQueue(&storage_desc, IID_PPV_ARGS(c->storage.put())));
+        GD_TRY(init_bindless(c.get()));
         *out = c.release();
         return S_OK;
     } GD_CATCH
@@ -653,6 +732,10 @@ extern "C" gd_result gd_release_buffer(gd_context *c, gd_buffer *b, uint32_t tim
     if (!c || !b || b->owner != c) return E_INVALIDARG;
     GD_TRY(wait_fence(c, c->storage_fence.p, b->last_storage, timeout));
     GD_TRY(wait_fence(c, c->compute_fence.p, b->last_compute, timeout));
+    // Bindless dispatches do not record which buffers they touch.
+    if (b->srv_index != UINT32_MAX) GD_TRY(wait_fence(c, c->compute_fence.p, c->last_bindless_compute, timeout));
+    if (b->srv_index != UINT32_MAX) c->heap_free.push_back(b->srv_index);
+    if (b->uav_index != UINT32_MAX) c->heap_free.push_back(b->uav_index);
     c->buffers.erase(std::find(c->buffers.begin(), c->buffers.end(), b));
     delete b;
     return S_OK;
@@ -673,4 +756,239 @@ extern "C" gd_result gd_destroy(gd_context *c, uint32_t timeout) {
     c->storage->Close();
     delete c;
     return S_OK;
+}
+
+// ---- Bindless compute API ----
+
+static uint32_t alloc_descriptor(gd_context *c) {
+    if (!c->heap_free.empty()) {
+        const uint32_t index = c->heap_free.back();
+        c->heap_free.pop_back();
+        return index;
+    }
+    if (c->heap_next >= c->heap_capacity) return UINT32_MAX;
+    return c->heap_next++;
+}
+
+static D3D12_CPU_DESCRIPTOR_HANDLE descriptor_cpu(gd_context *c, uint32_t index) {
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = cpu_heap_start(c->heap.p);
+    handle.ptr += uint64_t(index) * c->descriptor_size;
+    return handle;
+}
+
+extern "C" gd_result gd_create_resource(gd_context *c, uint64_t bytes, uint32_t kind,
+    gd_buffer **out, gd_buffer_info *info) {
+    if (!c || !out || !info || !bytes || kind > GD_RESOURCE_HOST) return E_INVALIDARG;
+    if (!c->heap.p) return DXGI_ERROR_UNSUPPORTED;
+    *out = nullptr;
+    *info = {};
+    const uint64_t padded = (bytes + 255) & ~uint64_t(255);
+    // Raw views address 32-bit elements; shaders use 32-bit byte offsets.
+    if (padded / 4 > UINT32_MAX || padded > (uint64_t(1) << 32)) return E_INVALIDARG;
+    try {
+        auto b = std::make_unique<gd_buffer>();
+        b->owner = c;
+        b->bytes = bytes;
+        D3D12_HEAP_PROPERTIES heap{};
+        if (kind == GD_RESOURCE_HOST) {
+            heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+            heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+            heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        } else {
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        }
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = padded;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        GD_TRY(c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(b->resource.put())));
+        if (kind == GD_RESOURCE_HOST) {
+            D3D12_RANGE none{0, 0};
+            GD_TRY(b->resource->Map(0, &none, &b->mapped));
+            std::memset(b->mapped, 0, static_cast<size_t>(padded));
+        }
+        b->srv_index = alloc_descriptor(c);
+        b->uav_index = alloc_descriptor(c);
+        if (b->srv_index == UINT32_MAX || b->uav_index == UINT32_MAX) {
+            if (b->srv_index != UINT32_MAX) c->heap_free.push_back(b->srv_index);
+            if (b->uav_index != UINT32_MAX) c->heap_free.push_back(b->uav_index);
+            return E_OUTOFMEMORY;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.NumElements = static_cast<UINT>(padded / 4);
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        c->device->CreateShaderResourceView(b->resource.p, &srv, descriptor_cpu(c, b->srv_index));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = DXGI_FORMAT_R32_TYPELESS;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav.Buffer.NumElements = static_cast<UINT>(padded / 4);
+        uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        c->device->CreateUnorderedAccessView(b->resource.p, nullptr, &uav, descriptor_cpu(c, b->uav_index));
+        info->srv_index = b->srv_index;
+        info->uav_index = b->uav_index;
+        info->mapped = b->mapped;
+        info->gpu_address = b->resource->GetGPUVirtualAddress();
+        info->allocated_bytes = padded;
+        c->buffers.push_back(b.get());
+        *out = b.release();
+        return S_OK;
+    } GD_CATCH
+}
+
+extern "C" gd_result gd_create_pipeline(gd_context *c, const void *dxil, size_t bytes, gd_pipeline **out) {
+    if (!c || !dxil || !bytes || !out) return E_INVALIDARG;
+    if (!c->bindless_root.p) return DXGI_ERROR_UNSUPPORTED;
+    *out = nullptr;
+    try {
+        auto p = std::make_unique<gd_pipeline>();
+        p->owner = c;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = c->bindless_root.p;
+        desc.CS = {dxil, bytes};
+        GD_TRY(c->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(p->pso.put())));
+        c->pipelines.push_back(p.get());
+        *out = p.release();
+        return S_OK;
+    } GD_CATCH
+}
+
+extern "C" gd_result gd_release_pipeline(gd_context *c, gd_pipeline *p, uint32_t timeout) {
+    if (!c || !p || p->owner != c) return E_INVALIDARG;
+    GD_TRY(wait_fence(c, c->compute_fence.p, c->last_bindless_compute, timeout));
+    c->pipelines.erase(std::find(c->pipelines.begin(), c->pipelines.end(), p));
+    delete p;
+    return S_OK;
+}
+
+extern "C" gd_result gd_begin(gd_context *c, uint32_t timeout) {
+    if (!c) return E_INVALIDARG;
+    if (!c->bindless_root.p) return DXGI_ERROR_UNSUPPORTED;
+    if (c->recording >= 0) return E_ILLEGAL_METHOD_CALL;
+    Frame &frame = c->frames[c->next_frame];
+    GD_TRY(wait_fence(c, c->compute_fence.p, frame.ticket, timeout));
+    GD_TRY(frame.allocator->Reset());
+    GD_TRY(frame.list->Reset(frame.allocator.p, nullptr));
+    ID3D12DescriptorHeap *heaps[] = {c->heap.p};
+    frame.list->SetDescriptorHeaps(1, heaps);
+    frame.list->SetComputeRootSignature(c->bindless_root.p);
+    c->recording = static_cast<int>(c->next_frame);
+    c->next_frame = (c->next_frame + 1) % 3;
+    c->timestamp_count = 0;
+    return S_OK;
+}
+
+extern "C" gd_result gd_dispatch(gd_context *c, gd_pipeline *p, const uint32_t *constants,
+    uint32_t constant_count, uint32_t x, uint32_t y, uint32_t z) {
+    if (!c || !p || p->owner != c || c->recording < 0 || constant_count > bindless_constant_dwords ||
+        (constant_count && !constants) || !x || !y || !z || x > 65535 || y > 65535 || z > 65535) return E_INVALIDARG;
+    auto *list = c->frames[c->recording].list.p;
+    list->SetPipelineState(p->pso.p);
+    if (constant_count) list->SetComputeRoot32BitConstants(0, constant_count, constants, 0);
+    list->Dispatch(x, y, z);
+    return S_OK;
+}
+
+extern "C" gd_result gd_barrier(gd_context *c) {
+    if (!c || c->recording < 0) return E_INVALIDARG;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = nullptr;
+    c->frames[c->recording].list->ResourceBarrier(1, &barrier);
+    return S_OK;
+}
+
+extern "C" gd_result gd_timestamp(gd_context *c, uint32_t *out_index) {
+    if (!c || !out_index || c->recording < 0) return E_INVALIDARG;
+    if (c->timestamp_count >= 4096) return E_OUTOFMEMORY;
+    *out_index = c->timestamp_count;
+    c->frames[c->recording].list->EndQuery(c->timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, c->timestamp_count++);
+    return S_OK;
+}
+
+extern "C" gd_result gd_submit(gd_context *c, uint64_t *ticket) {
+    if (!c || !ticket || c->recording < 0) return E_INVALIDARG;
+    Frame &frame = c->frames[c->recording];
+    if (c->timestamp_count)
+        frame.list->ResolveQueryData(c->timestamps.p, D3D12_QUERY_TYPE_TIMESTAMP, 0, c->timestamp_count,
+            c->timestamp_readback.p, 0);
+    c->recording = -1;
+    GD_TRY(frame.list->Close());
+    if (c->next_compute == UINT64_MAX - 1) return E_UNEXPECTED;
+    ID3D12CommandList *lists[] = {frame.list.p};
+    c->compute->ExecuteCommandLists(1, lists);
+    *ticket = ++c->next_compute;
+    frame.ticket = *ticket;
+    c->last_bindless_compute = *ticket;
+    return c->compute->Signal(c->compute_fence.p, *ticket);
+}
+
+extern "C" gd_result gd_wait_compute(gd_context *c, uint64_t ticket, uint32_t timeout) {
+    if (!c || ticket > c->next_compute) return E_INVALIDARG;
+    return wait_fence(c, c->compute_fence.p, ticket, timeout);
+}
+
+extern "C" gd_result gd_read_timestamps(gd_context *c, uint32_t count, uint64_t *out, uint64_t *frequency) {
+    if (!c || !out || !frequency || count > 4096) return E_INVALIDARG;
+    void *mapped = nullptr;
+    D3D12_RANGE read{0, size_t(count) * 8};
+    GD_TRY(c->timestamp_readback->Map(0, &read, &mapped));
+    std::memcpy(out, mapped, size_t(count) * 8);
+    D3D12_RANGE none{0, 0};
+    c->timestamp_readback->Unmap(0, &none);
+    *frequency = c->timestamp_frequency;
+    return S_OK;
+}
+
+extern "C" gd_result gd_queue_wait_storage(gd_context *c, uint64_t storage_ticket) {
+    if (!c || storage_ticket > c->next_storage) return E_INVALIDARG;
+    return c->compute->Wait(c->storage_fence.p, storage_ticket);
+}
+
+extern "C" gd_result gd_read_ranges_after(gd_context *c, gd_file *f, gd_buffer *b,
+    const gd_range *ranges, uint32_t count, uint64_t compute_ticket, uint64_t *ticket) {
+    if (!c || !f || !b || !ranges || !ticket || f->owner != c || b->owner != c ||
+        !count || count > c->queue_capacity / 2 - 2 || compute_ticket > c->next_compute) return E_INVALIDARG;
+    *ticket = 0;
+    try {
+        uint64_t io_complete, compute_complete;
+        HRESULT polled = gd_poll(c, &io_complete, &compute_complete);
+        if (FAILED(polled) && polled != E_PENDING) return polled;
+        if (c->next_storage == UINT64_MAX - 1) return E_UNEXPECTED;
+        std::vector<DSTORAGE_REQUEST> requests(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &r = ranges[i];
+            if (!r.bytes || r.reserved || r.bytes > c->staging_bytes ||
+                r.file_offset > f->bytes || r.bytes > f->bytes - r.file_offset ||
+                r.buffer_offset > b->bytes || r.bytes > b->bytes - r.buffer_offset) return E_INVALIDARG;
+            auto &request = requests[i];
+            request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+            request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+            request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+            request.Source.File = {f->file.p, r.file_offset, r.bytes};
+            request.Destination.Buffer = {b->resource.p, r.buffer_offset, r.bytes};
+            request.Name = "gyro-arena-range";
+        }
+        Batch batch{};
+        batch.ticket = c->next_storage + 1;
+        GD_TRY(c->storage_factory->CreateStatusArray(1, "gyro-arena-status", IID_PPV_ARGS(batch.status.put())));
+        c->batches.push_back(std::move(batch));
+        c->storage->EnqueueRequests(requests.data(), count, c->compute_fence.p,
+            compute_ticket, DSTORAGE_ENQUEUE_REQUEST_FLAG_FENCE_WAIT_BEFORE_GPU_WORK);
+        c->storage->EnqueueStatus(c->batches.back().status.p, 0);
+        c->storage->EnqueueSignal(c->storage_fence.p, ++c->next_storage);
+        c->storage->Submit();
+        b->last_storage = f->last_storage = *ticket = c->next_storage;
+        return S_OK;
+    } GD_CATCH
 }

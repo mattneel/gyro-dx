@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the pinned Zig compiler
+        run: python scripts/bootstrap_zig.py
+      - name: Unit tests
+        shell: bash
+        run: .tools/zig/zig${{ runner.os == 'Windows' && '.exe' || '' }} build test --summary all
+      - name: Build
+        shell: bash
+        run: .tools/zig/zig${{ runner.os == 'Windows' && '.exe' || '' }} build -Doptimize=ReleaseSafe
+      - name: CLI integration
+        shell: bash
+        run: python tests/integration.py zig-out/bin/gyro-dx${{ runner.os == 'Windows' && '.exe' || '' }}

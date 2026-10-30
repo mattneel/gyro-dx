@@ -23,6 +23,7 @@ try {
     Copy-Item -Force -Recurse (Join-Path $nativeOutput "D3D12") $output
     Copy-Item -Force ".\native\build\linalg_smoke.dxil" $output
     Copy-Item -Force ".\native\build\gyro_decode.dxil" $output
+    Copy-Item -Force -Recurse ".\native\build\kernels" $output
     Write-Output (Join-Path $output "gyro-dx.exe")
 } finally {
     Pop-Location

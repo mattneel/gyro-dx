@@ -2,8 +2,7 @@
 
 ## Scope
 
-This package contains format, address, and cache components for the specified model.
-It does not implement the complete Qwen4Exp graph.
+This package implements the complete Qwen4Exp graph for the specified model on the CPU and on Direct3D 12.
 The source package contains no model weights.
 
 The measurements below come from the two GGUF headers at one pinned repository revision.
@@ -171,7 +170,8 @@ The comparison does not claim bit parity for NaN payload propagation across plat
 The scalar HLSL reference kernel uses the same packed codebook and trellis definitions.
 It emits 128 float32 values per block and leaves rotation separate.
 The kernel compiled with DXC for Shader Model 6.0.
-GPU execution and GPU parity remain unverified in this environment.
+On the RTX 5090 Laptop GPU, the scalar kernel matches the CPU decoder bit for bit for all eight types.
+The inference engine uses a fused decoder and matrix-vector kernel in `shaders/engine/moe.hlsl`.
 
 ## Rotation
 
