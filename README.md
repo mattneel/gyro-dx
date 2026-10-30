@@ -20,7 +20,8 @@ Decoding was greedy, with all experts resident unless stated otherwise.
 
 | Workload | Prefill | Decode | Decode latency p50 / p95 |
 | --- | ---: | ---: | ---: |
-| GPU, 512-token prompt, 256 generated | 80 tok/s | 56.9 tok/s | 17.5 / 18.5 ms |
+| GPU, 1,024-token prompt, 128 generated | 247 tok/s | 54.6 tok/s | 17.6 ms |
+| GPU, 512-token prompt, 256 generated, before LinAlg prefill | 80 tok/s | 56.9 tok/s | 17.5 / 18.5 ms |
 | GPU, 4,096-token prompt, 128 generated | 76 tok/s | 54.2 tok/s | 18.4 / 19.4 ms |
 | GPU, 4 GiB expert cache, prefetch on | 31 tok/s | 20.0 tok/s | 47.7 / 74.3 ms |
 | GPU, 4 GiB expert cache, prefetch off | 33 tok/s | 18.7 tok/s | 50.6 / 83.0 ms |
@@ -196,8 +197,11 @@ The GPU engine emits logits and greedy traces.
 - The engine serves one sequence at a time.
   Batched multi-user decoding and multi-token prediction are not implemented.
 - Image and video inputs are not supported. The PLE image-token path is unused.
-- Prefill runs in passes of 8 tokens through matrix-vector kernels.
-  LinAlg wave matrices pass validation on the target driver, but no inference kernel uses them yet.
+- Prefill uses LinAlg wave matrices for Q8_0 products in passes of 64 tokens.
+  The activations enter the tiles as FP16.
+  Final logits then differ from the CPU engine by 4.9% relative RMS, against 0.95% for the matrix-vector path, and greedy traces stay identical.
+  Routed experts still use the per-slot fused kernel during prefill.
+  Adapters without LinAlg fall back to matrix-vector kernels.
 - Logits match the reference runtime with cosine similarity 0.979. Greedy traces are identical.
   [INFERENCE] The likely cause is that the reference CPU path quantizes activations before quantized products. This engine keeps activations in float32.
 

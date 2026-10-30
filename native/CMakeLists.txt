@@ -82,6 +82,7 @@ if(GYRO_DXC_DIR)
         gdn:conv_causal gdn:gdn_gates gdn:gdn_step
         attn:rope_neox attn:store_f16 attn:attn_chunk attn:attn_merge attn:qsa_pool attn:qsa_score attn:qsa_select
         ple:ple_mix hc:hc_pre hc:hc_post)
+    set(GYRO_LINALG_KERNELS gemm:gemm_q8)
     set(GYRO_KERNEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/kernels")
     file(GLOB GYRO_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/*.hlsl"
         "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/*.hlsli")
@@ -95,6 +96,20 @@ if(GYRO_DXC_DIR)
             COMMAND ${CMAKE_COMMAND} -E make_directory "${GYRO_KERNEL_DIR}"
             COMMAND "${GYRO_DXC_DIR}/bin/x64/dxc.exe" -T cs_6_6 -E ${entry} -HV 2021 -O3
                 "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/${file}.hlsl" -Fo "${out}"
+            DEPENDS ${GYRO_KERNEL_SOURCES}
+            VERBATIM)
+        list(APPEND GYRO_KERNEL_OUTPUTS "${out}")
+    endforeach()
+    # LinAlg kernels need the experimental Shader Model 6.10 and the SDK's linalg header.
+    foreach(spec IN LISTS GYRO_LINALG_KERNELS)
+        string(REPLACE ":" ";" parts "${spec}")
+        list(GET parts 0 file)
+        list(GET parts 1 entry)
+        set(out "${GYRO_KERNEL_DIR}/${entry}.dxil")
+        add_custom_command(OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GYRO_KERNEL_DIR}"
+            COMMAND "${GYRO_DXC_DIR}/bin/x64/dxc.exe" -T cs_6_10 -E ${entry} -HV 2021 -O3 -enable-16bit-types
+                -I "${GYRO_DXC_DIR}/inc" "${CMAKE_CURRENT_SOURCE_DIR}/../shaders/engine/${file}.hlsl" -Fo "${out}"
             DEPENDS ${GYRO_KERNEL_SOURCES}
             VERBATIM)
         list(APPEND GYRO_KERNEL_OUTPUTS "${out}")

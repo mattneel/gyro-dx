@@ -28,13 +28,17 @@ pub const Options = struct {
     prefetch: bool = true,
 };
 
-/// Activation rows per GPU pass. Larger prompts run in passes of this size.
-pub const max_tok = 8;
+/// Activation rows per GPU pass with resident experts. Larger prompts run in passes of this size.
+pub const max_tok = 64;
+/// Pass size in cache mode. It bounds one layer's admission batch.
+pub const cache_tok = 8;
+/// Products with more rows than this use LinAlg tiles when the adapter supports them.
+const gemm_min_tok = 8;
 
 const Kernel = enum {
     mv_q8, q8_repack, mv_bf16, mv_f32, moe_route, moe_resolve, moe_gyro, moe_act, rotate128, moe_combine,
     norm_rows, hc_mix, hc_combine, hc_init, ew, conv_causal, gdn_gates, gdn_step,
-    rope_neox, store_f16, attn_chunk, attn_merge, qsa_pool, qsa_score, qsa_select, ple_mix, hc_pre, hc_post,
+    rope_neox, store_f16, attn_chunk, attn_merge, qsa_pool, qsa_score, qsa_select, ple_mix, hc_pre, hc_post, gemm_q8,
 };
 
 const Weight = struct { srv: u32, off: u32, type_id: u32, rows: u32, cols: u32, row_bytes: u32 };
@@ -138,6 +142,7 @@ pub const Engine = struct {
     stats: Stats = .{},
     options: Options,
     scratch: ?gpu.Buffer = null,
+    linalg: bool = false,
     marks: [4096]Phase = undefined,
     mark_count: u32 = 0,
 
@@ -223,13 +228,22 @@ pub const Engine = struct {
     fn loadKernels(e: *Engine) !void {
         var dir = try Io.Dir.cwd().openDir(e.io, e.options.kernel_dir, .{});
         defer dir.close(e.io);
+        // LinAlg needs Shader Model 6.10 and wave FP16 multiplication with FP32 accumulation.
+        e.linalg = e.dev.caps.shader_model >= 0x6a and (e.dev.caps.wave16_fp16_fp32_flags & 1) != 0;
         inline for (@typeInfo(Kernel).@"enum".field_names) |name| {
-            const bytes = dir.readFileAlloc(e.io, name ++ ".dxil", e.allocator, .limited(4 << 20)) catch |err| {
-                std.log.err("kernel {s}.dxil: {s}", .{ name, @errorName(err) });
+            const optional = comptime std.mem.eql(u8, name, "gemm_q8");
+            if (!optional or e.linalg) try e.loadKernel(&dir, @field(Kernel, name), name ++ ".dxil");
+        }
+    }
+
+    fn loadKernel(e: *Engine, dir: *Io.Dir, kernel: Kernel, file: []const u8) !void {
+        {
+            const bytes = dir.readFileAlloc(e.io, file, e.allocator, .limited(4 << 20)) catch |err| {
+                std.log.err("kernel {s}: {s}", .{ file, @errorName(err) });
                 return err;
             };
             defer e.allocator.free(bytes);
-            e.pipes.set(@field(Kernel, name), try e.dev.pipeline(bytes));
+            e.pipes.set(kernel, try e.dev.pipeline(bytes));
         }
     }
 
@@ -596,7 +610,7 @@ pub const Engine = struct {
             },
         }
         // A cached layer needs room for the experts of one pass.
-        const min_slots = h.n_expert_used * max_tok * 2;
+        const min_slots = h.n_expert_used * cache_tok * 2;
         if (slots < min_slots) return error.InsufficientVideoMemory;
         e.resident = slots == all_slots;
         const n_arenas = (slots + e.per_arena - 1) / e.per_arena;
@@ -660,7 +674,7 @@ pub const Engine = struct {
         const h = e.m.h;
         const U = h.n_expert_used;
         const lw = e.layers[il];
-        var leases: [max_tok * 16]cache_mod.Lease = undefined;
+        var leases: [cache_tok * 16]cache_mod.Lease = undefined;
         const n = n_tok * U;
         const ids = e.ids_host.words()[0..n];
         e.stats.expert_requests += n;
@@ -699,7 +713,7 @@ pub const Engine = struct {
     fn enqueueLoads(e: *Engine, il: usize, ids: []const u32, leases: []cache_mod.Lease) !Issued {
         const h = e.m.h;
         const lw = e.layers[il];
-        var requests: [max_tok * 16]cache_mod.Request = undefined;
+        var requests: [cache_tok * 16]cache_mod.Request = undefined;
         for (ids, 0..) |ex, k| {
             if (ex >= h.n_expert) return error.InvalidExpertId;
             requests[k] = .{ .key = .{ .layer = @intCast(il), .expert = ex }, .bytes = lw.bundle_bytes };
@@ -707,7 +721,7 @@ pub const Engine = struct {
         const fence = cache_mod.LoadFence{ .value = e.dev.next_storage + 1 };
         try e.cache.observeCompute(.{ .value = e.compute_done });
         try e.cache.acquireBatch(requests[0..ids.len], fence, leases[0..ids.len]);
-        var ranges: [8][max_tok * 16 * 3]c.gd_range = undefined;
+        var ranges: [8][cache_tok * 16 * 3]c.gd_range = undefined;
         var counts: [8]usize = @splat(0);
         var misses: u32 = 0;
         for (leases[0..ids.len], 0..) |lease, k| {
@@ -747,7 +761,7 @@ pub const Engine = struct {
     /// Issues speculative loads for predicted experts of a later layer. Leases are released at
     /// once; loading slots cannot be evicted, and the demand path resolves them.
     fn prefetchLayer(e: *Engine, il: usize, ids: []const u32) !void {
-        var leases: [max_tok * 16]cache_mod.Lease = undefined;
+        var leases: [cache_tok * 16]cache_mod.Lease = undefined;
         const issued = e.enqueueLoads(il, ids, &leases) catch |err| switch (err) {
             error.CacheFull => return, // a pinned working set leaves no room to speculate
             else => return err,
@@ -824,6 +838,11 @@ pub const Engine = struct {
     fn mv(e: *Engine, w: Weight, x_uav: u32, x_off: u32, x_stride: u32, y_uav: u32, y_off: u32, y_stride: u32,
         n_tok: u32, act: u32, scale: f32, accumulate: bool) !void
     {
+        if (e.linalg and w.type_id == kernels.type_q8_0 and n_tok > gemm_min_tok) {
+            const cst = [16]u32{ w.srv, w.off, w.rows, w.cols, x_uav, x_off, x_stride, n_tok,
+                y_uav, y_off, y_stride, @intFromBool(accumulate), act, bits(scale), w.row_bytes, 0 };
+            return e.dispatch(.gemm_q8, &cst, (w.rows + 63) / 64, (n_tok + 15) / 16, 1);
+        }
         const k: Kernel = switch (w.type_id) {
             kernels.type_q8_0 => .mv_q8,
             kernels.type_bf16 => .mv_bf16,
@@ -874,6 +893,7 @@ pub const Engine = struct {
         const HD = h.hcDim();
         if (w.down.type_id != kernels.type_q8_0 or w.up.type_id != kernels.type_q8_0 or
             (with_inject and w.inject.?.type_id != kernels.type_q8_0)) return error.UnsupportedTensorType;
+        if (n_tok > gemm_min_tok and e.linalg) return e.hcMixTiled(w, res_off, n_tok, with_inject);
         const inj = w.inject orelse w.down;
         const pre = [20]u32{ e.res.uav, res_off, w.norm.srv, w.norm.off, w.down.srv, w.down.row_bytes, inj.srv, inj.row_bytes,
             h.hc_rank, h.hc, h.n_embd, e.lo.uav, e.inject.uav, e.hc_scale.uav, bits(h.eps), @intFromBool(with_inject), HD, 0, 0, 0 };
@@ -882,6 +902,22 @@ pub const Engine = struct {
         const post = [16]u32{ w.up.srv, w.up.row_bytes, e.lo.uav, e.res.uav, res_off, w.norm.srv, w.norm.off, e.hc_scale.uav,
             e.cur.uav, h.n_embd, h.hc, h.hc_rank, HD, 0, 0, 0 };
         try e.dispatch(.hc_post, &post, (h.n_embd + 7) / 8, n_tok, 1);
+        try e.dev.barrier();
+    }
+
+    /// Large passes: grouped norm, then the low-rank products as LinAlg tiles, then the gated mean.
+    fn hcMixTiled(e: *Engine, w: HcW, res_off: u32, n_tok: u32, with_inject: bool) !void {
+        const h = e.m.h;
+        const HD = h.hcDim();
+        try e.norm(e.res.uav, res_off, e.xn.uav, 0, h.n_embd, h.hc, h.n_embd, HD, n_tok, w.norm, 1, false);
+        try e.dev.barrier();
+        try e.mv(w.down, e.xn.uav, 0, HD, e.lo.uav, 0, h.hc_rank, n_tok, 1, 1.0 / @as(f32, @floatFromInt(h.hc)), false);
+        if (with_inject) try e.mv(w.inject.?, e.xn.uav, 0, HD, e.inject.uav, 0, h.hc, n_tok, 0, 1.0, false);
+        try e.dev.barrier();
+        try e.mv(w.up, e.lo.uav, 0, h.hc_rank, e.gate.uav, 0, HD, n_tok, 0, 1.0, false);
+        try e.dev.barrier();
+        const cst = [12]u32{ e.xn.uav, 0, e.gate.uav, 0, e.cur.uav, 0, h.n_embd, h.hc, n_tok, 0, 0, 0 };
+        try e.dispatch(.hc_mix, &cst, (h.n_embd * n_tok + 255) / 256, 1, 1);
         try e.dev.barrier();
     }
 
@@ -1146,7 +1182,7 @@ pub const Engine = struct {
         for (tokens) |t| if (t >= e.m.h.n_vocab) return error.InvalidToken;
         var i: usize = 0;
         while (i < tokens.len) {
-            const end = @min(tokens.len, i + max_tok);
+            const end = @min(tokens.len, i + @as(usize, if (e.resident) max_tok else cache_tok));
             try e.pass(tokens[i..end], if (end == tokens.len) logits else null);
             i = end;
         }
