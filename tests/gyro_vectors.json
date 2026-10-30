@@ -1,0 +1,14 @@
+{
+  "upstream": "https://gitlab.com/agentionai-group/agention-gyro",
+  "revision": "587a5269848eb07996c9c1433f9ad638604eb4d8",
+  "oracle": "src/tq_ref.c:tq_dequantize_row",
+  "seed": 1197036111,
+  "decode_cases": 512,
+  "decoded_values": 65536,
+  "rotation_widths": [
+    640,
+    2560
+  ],
+  "finite_scale_bits": "All signs, zero, subnormal, normal, maximum finite, and deterministic random values.",
+  "sha256": "8f739c3eb9cd3099ec7ccd1f46f60fb115cf2ec87d2ac6c373f2a49ed032818c"
+}

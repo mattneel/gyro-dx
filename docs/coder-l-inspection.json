@@ -1,0 +1,32 @@
+{
+  "architecture": "qwen4exp",
+  "header_only": true,
+  "file_bytes": 83975625408,
+  "header_bytes": 11043008,
+  "header_sha256": "5b14b64c3a371f0a45ac2fc90125a1488fa13a5723e0ce162a3f3ab54da4e997",
+  "alignment": 32,
+  "tensor_count": 1224,
+  "metadata_count": 83,
+  "summary": {
+    "total_tensor_bytes": 83964582400,
+    "expert_bytes": 24222105600,
+    "resident_expert_allocation_bytes": 24561844224,
+    "disk_table_bytes": 54400261120,
+    "fixed_weight_bytes": 5342215680,
+    "max_expert_bundle_bytes": 2227200,
+    "min_expert_bundle_bytes": 1612800,
+    "expert_slots": 12288,
+    "layers": 48,
+    "experts_per_layer": 256,
+    "active_experts": 10,
+    "cold_bytes_per_token": 946176000
+  },
+  "ple": {
+    "layer": 1,
+    "heads": 16,
+    "row_bytes": 170,
+    "eos_token": 248044,
+    "vocabulary_size": 248320
+  },
+  "inference_available": false
+}

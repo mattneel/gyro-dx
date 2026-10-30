@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+.tools/
+native/build/
+native/packages/
+__pycache__/
+*.gguf
+*.dxil
+*.dll
+*.exe
+*.lib
+*.obj
